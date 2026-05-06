@@ -1,104 +1,149 @@
-"""Microstructure features derived from OHLCV bar geometry.
+"""Microstructure features: sessions, killzones, round levels, session H/L.
 
-These features capture intra-bar price action patterns that may signal
-order flow imbalances, momentum, or institutional activity.
+All times are UTC. Session definitions follow ICT / retail convention:
+  Asian   00:00 – 07:00 UTC
+  London  07:00 – 16:00 UTC
+  NY      12:00 – 21:00 UTC
+  Overlap 12:00 – 16:00 UTC (London + NY)
+
+Killzones (ICT):
+  London KZ   07:00 – 10:00 UTC
+  NY KZ       12:00 – 15:00 UTC
+  Asian KZ    20:00 – 23:00 UTC
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import time
 
-import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-FEATURE_NAMES: list[str] = [
-    "bar_range",           # high - low (absolute)
-    "bar_range_pct",       # bar_range as percentile vs. rolling 100 bars
-    "body_ratio",          # |close - open| / bar_range
-    "upper_wick_ratio",    # upper wick / bar_range
-    "lower_wick_ratio",    # lower wick / bar_range
-    "bar_direction",       # +1 bullish, -1 bearish, 0 doji
-    "volume_ma_ratio",     # tick_volume / rolling 20-bar mean volume
-    "range_ma_ratio",      # bar_range / rolling 20-bar mean range
-    "spread_proxy",        # (high - low - |close - open|) / close — approx spread
-    "successive_direction",# count of bars in same direction (streak)
-]
+# ── Session time boundaries (UTC, half-open intervals [start, end)) ───────────
+_SESSIONS: dict[str, tuple[int, int]] = {
+    "london":  (7,  16),
+    "ny":      (12, 21),
+    "asian":   (0,   7),   # simplified: also covers 21-24 from previous day
+}
+
+_KILLZONES: dict[str, tuple[int, int]] = {
+    "london": (7,  10),
+    "ny":     (12, 15),
+    "asian":  (20, 23),
+}
 
 
-def add_microstructure_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute microstructure features and append them to *df*.
+def get_session_active(ts: pd.Timestamp) -> str:
+    """Return the trading session active at *ts* (UTC).
+
+    Returns one of: ``'london'``, ``'ny'``, ``'overlap'``, ``'asian'``, ``'off'``.
+    """
+    h = ts.hour + ts.minute / 60.0
+    in_london = 7.0 <= h < 16.0
+    in_ny     = 12.0 <= h < 21.0
+    in_asian  = h < 7.0 or h >= 21.0
+
+    if in_london and in_ny:
+        return "overlap"
+    if in_london:
+        return "london"
+    if in_ny:
+        return "ny"
+    if in_asian:
+        return "asian"
+    return "off"
+
+
+def get_killzone(ts: pd.Timestamp) -> str | None:
+    """Return the active killzone at *ts* (UTC), or ``None``."""
+    h = ts.hour + ts.minute / 60.0
+    for kz, (start, end) in _KILLZONES.items():
+        if start <= h < end:
+            return kz
+    return None
+
+
+def dist_to_round_level(price: float, step: float) -> float:
+    """Absolute distance from *price* to the nearest multiple of *step*."""
+    nearest = round(price / step) * step
+    return abs(price - nearest)
+
+
+def get_distance_to_round_levels(price: float) -> dict[str, float]:
+    """Return distances (in price units) to nearest $50 and $100 round levels.
 
     Parameters
     ----------
-    df:
-        OHLCV DataFrame with ``open``, ``high``, ``low``, ``close``,
-        ``tick_volume`` columns.
+    price:
+        Current price (XAUUSD, e.g. 3250.40).
 
     Returns
     -------
-    pd.DataFrame
-        Original DataFrame with additional microstructure feature columns.
+    dict
+        Keys: ``dist_50``, ``dist_100``.
     """
-    df = df.copy()
-
-    # ── Bar geometry ──────────────────────────────────────────────────────────
-    df["bar_range"] = df["high"] - df["low"]
-    df["bar_body"] = (df["close"] - df["open"]).abs()
-
-    _safe_range = df["bar_range"].replace(0, np.nan)
-    df["body_ratio"] = df["bar_body"] / _safe_range
-
-    upper_wick = df["high"] - df[["open", "close"]].max(axis=1)
-    lower_wick = df[["open", "close"]].min(axis=1) - df["low"]
-    df["upper_wick_ratio"] = upper_wick / _safe_range
-    df["lower_wick_ratio"] = lower_wick / _safe_range
-
-    # ── Bar direction ─────────────────────────────────────────────────────────
-    df["bar_direction"] = np.sign(df["close"] - df["open"]).astype(int)
-
-    # ── Range percentile (rolling 100-bar window) ─────────────────────────────
-    df["bar_range_pct"] = (
-        df["bar_range"]
-        .rolling(100, min_periods=10)
-        .apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False)
-    )
-
-    # ── Volume ratios ─────────────────────────────────────────────────────────
-    vol_ma = df["tick_volume"].rolling(20, min_periods=1).mean()
-    df["volume_ma_ratio"] = df["tick_volume"] / vol_ma.replace(0, np.nan)
-
-    range_ma = df["bar_range"].rolling(20, min_periods=1).mean()
-    df["range_ma_ratio"] = df["bar_range"] / range_ma.replace(0, np.nan)
-
-    # ── Spread proxy ──────────────────────────────────────────────────────────
-    df["spread_proxy"] = (df["bar_range"] - df["bar_body"]) / df["close"]
-
-    # ── Directional streak ────────────────────────────────────────────────────
-    df["successive_direction"] = _directional_streak(df["bar_direction"])
-
-    # Drop helper column
-    df = df.drop(columns=["bar_body"])
-
-    logger.debug("Microstructure features added.")
-    return df
+    return {
+        "dist_50":  dist_to_round_level(price, 50.0),
+        "dist_100": dist_to_round_level(price, 100.0),
+    }
 
 
-# ── private helpers ────────────────────────────────────────────────────────────
+def get_session_levels(df_m15: pd.DataFrame, ts: pd.Timestamp) -> dict[str, float]:
+    """Compute session high/low for Asian and London sessions visible at *ts*.
 
-def _directional_streak(direction: pd.Series) -> pd.Series:
-    """Count consecutive bars in the same direction (signed streak).
+    Looks back at bars before *ts* to find:
+    - Previous Asian session (00:00-07:00 UTC, yesterday)
+    - Current or previous London session (07:00-16:00 UTC)
 
-    A bullish streak is positive; bearish streak is negative; doji resets to 0.
+    Parameters
+    ----------
+    df_m15:
+        M15 OHLCV DataFrame with tz-aware DatetimeIndex.
+    ts:
+        Timestamp of the trade entry (UTC-aware).
+
+    Returns
+    -------
+    dict
+        Keys: asia_high, asia_low, london_high, london_low.
+        Returns NaN for any session with no data.
     """
-    streak = pd.Series(0, index=direction.index, dtype=int)
-    for i in range(1, len(direction)):
-        d = direction.iloc[i]
-        if d == 0:
-            streak.iloc[i] = 0
-        elif d == direction.iloc[i - 1]:
-            streak.iloc[i] = streak.iloc[i - 1] + d
-        else:
-            streak.iloc[i] = d
-    return streak
+    bars_before = df_m15[df_m15.index < ts]
+    if bars_before.empty:
+        return {k: float("nan") for k in ("asia_high", "asia_low", "london_high", "london_low")}
+
+    today = ts.normalize()  # midnight UTC of ts's day
+
+    # ── Asian session high/low: 00:00-07:00 on today OR yesterday ────────────
+    _asia_high = _asia_low = float("nan")
+    for day_offset in (0, -1):
+        day = today + pd.Timedelta(days=day_offset)
+        asia_bars = bars_before[
+            (bars_before.index >= day) & (bars_before.index < day + pd.Timedelta(hours=7))
+        ]
+        if not asia_bars.empty:
+            _asia_high = asia_bars["high"].max()
+            _asia_low  = asia_bars["low"].min()
+            break
+
+    # ── London session high/low: 07:00-16:00 on today OR yesterday ───────────
+    _lon_high = _lon_low = float("nan")
+    for day_offset in (0, -1):
+        day = today + pd.Timedelta(days=day_offset)
+        lon_bars = bars_before[
+            (bars_before.index >= day + pd.Timedelta(hours=7)) &
+            (bars_before.index <  day + pd.Timedelta(hours=16))
+        ]
+        if not lon_bars.empty:
+            _lon_high = lon_bars["high"].max()
+            _lon_low  = lon_bars["low"].min()
+            break
+
+    return {
+        "asia_high":   _asia_high,
+        "asia_low":    _asia_low,
+        "london_high": _lon_high,
+        "london_low":  _lon_low,
+    }

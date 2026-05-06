@@ -1,15 +1,15 @@
-"""Smart Money Concepts (SMC) feature builder.
+"""Smart Money Concepts feature extraction via the smartmoneyconcepts library.
 
-Wraps the ``smartmoneyconcepts`` library to extract structure-based
-features: BOS, CHoCH, Fair Value Gaps, and Order Blocks.
+The library exposes a class-based API: ``from smartmoneyconcepts import smc``,
+then call ``smc.swing_highs_lows(...)``, ``smc.bos_choch(...)``, etc.
 
-All features are computed on the bar that *closed*; no future information
-is used. Features are appended as new columns to the input DataFrame.
+``ob()`` requires a ``volume`` column; we rename ``tick_volume`` automatically.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -17,134 +17,176 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 try:
-    import smartmoneyconcepts as smc  # type: ignore[import]
+    from smartmoneyconcepts import smc as _smc
     _SMC_AVAILABLE = True
 except ImportError:
     _SMC_AVAILABLE = False
-    logger.warning(
-        "smartmoneyconcepts not installed — SMC features will be NaN. "
-        "Run: pip install smartmoneyconcepts"
-    )
-
-# Features produced by this module
-FEATURE_NAMES: list[str] = [
-    "bos_bullish",       # 1 if a bullish BOS occurred on this bar
-    "bos_bearish",       # 1 if a bearish BOS occurred on this bar
-    "choch_bullish",     # 1 if a bullish CHoCH occurred on this bar
-    "choch_bearish",     # 1 if a bearish CHoCH occurred on this bar
-    "fvg_bullish",       # 1 if bar is inside a bullish FVG
-    "fvg_bearish",       # 1 if bar is inside a bearish FVG
-    "ob_bullish",        # 1 if bar touches a bullish Order Block zone
-    "ob_bearish",        # 1 if bar touches a bearish Order Block zone
-    "premium_discount",  # +1 premium (above EQ), -1 discount (below EQ)
-    "liquidity_sweep",   # 1 if a recent swing high/low was swept this bar
-]
+    logger.warning("smartmoneyconcepts not installed — SMC features will be NaN.")
 
 
-def add_smc_features(df: pd.DataFrame, swing_length: int = 10) -> pd.DataFrame:
-    """Compute SMC features and append them to *df*.
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _prep_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a clean OHLCV DataFrame acceptable by smartmoneyconcepts.
+
+    Resets the integer index (required by the library) and ensures a
+    ``volume`` column exists (``ob()`` needs it).
+    """
+    cols = ["open", "high", "low", "close"]
+    out = df[cols].copy().reset_index(drop=True)
+    if "tick_volume" in df.columns:
+        out["volume"] = df["tick_volume"].values
+    elif "volume" not in df.columns:
+        out["volume"] = 0.0
+    return out
+
+
+# ── public API ────────────────────────────────────────────────────────────────
+
+def precompute_smc(
+    df: pd.DataFrame,
+    swing_length: int = 10,
+) -> dict[str, Optional[pd.DataFrame]]:
+    """Pre-compute all SMC structures on a full OHLC DataFrame.
 
     Parameters
     ----------
     df:
-        OHLCV DataFrame (must have ``open``, ``high``, ``low``, ``close``).
+        OHLCV DataFrame (DatetimeIndex, any standard OHLCV columns).
     swing_length:
-        Look-back for swing high/low detection (default 10 bars).
+        Look-back for swing high/low detection. Smaller values → more swings.
 
     Returns
     -------
-    pd.DataFrame
-        Original DataFrame with additional SMC feature columns.
+    dict with keys:
+        ``swings``  — DataFrame(HighLow, Level)
+        ``bos``     — DataFrame(BOS, CHOCH, Level, BrokenIndex)
+        ``fvg``     — DataFrame(FVG, Top, Bottom, MitigatedIndex)
+        ``ob``      — DataFrame(OB, Top, Bottom, OBVolume, MitigatedIndex) or None
+
+    All DataFrames share integer index aligned to *df*.
     """
-    df = df.copy()
+    result: dict[str, Optional[pd.DataFrame]] = {
+        "swings": None, "bos": None, "fvg": None, "ob": None
+    }
 
     if not _SMC_AVAILABLE:
-        for col in FEATURE_NAMES:
-            df[col] = np.nan
-        return df
+        return result
 
-    ohlc = df[["open", "high", "low", "close"]].copy()
+    ohlc = _prep_ohlc(df)
 
-    # ── Structure (BOS / CHoCH) ───────────────────────────────────────────────
-    structure = smc.swing_highs_lows(ohlc, swing_length=swing_length)
-    bos_df = smc.bos_choch(ohlc, structure, close_break=True)
+    try:
+        result["swings"] = _smc.swing_highs_lows(ohlc, swing_length=swing_length)
+    except Exception as exc:
+        logger.warning("swing_highs_lows failed: %s", exc)
+        return result
 
-    df["bos_bullish"] = _flag_series(bos_df, "BOS", "Bullish", len(df))
-    df["bos_bearish"] = _flag_series(bos_df, "BOS", "Bearish", len(df))
-    df["choch_bullish"] = _flag_series(bos_df, "CHOCH", "Bullish", len(df))
-    df["choch_bearish"] = _flag_series(bos_df, "CHOCH", "Bearish", len(df))
+    try:
+        result["bos"] = _smc.bos_choch(ohlc, result["swings"], close_break=True)
+    except Exception as exc:
+        logger.warning("bos_choch failed: %s", exc)
 
-    # ── Fair Value Gaps ───────────────────────────────────────────────────────
-    fvg_df = smc.fvg(ohlc)
-    df["fvg_bullish"] = _binary_col(fvg_df, "FVG", "Bullish", len(df))
-    df["fvg_bearish"] = _binary_col(fvg_df, "FVG", "Bearish", len(df))
+    try:
+        result["fvg"] = _smc.fvg(ohlc, join_consecutive=False)
+    except Exception as exc:
+        logger.warning("fvg failed: %s", exc)
 
-    # ── Order Blocks ──────────────────────────────────────────────────────────
-    ob_df = smc.ob(ohlc, structure)
-    df["ob_bullish"] = _binary_col(ob_df, "OB", "Bullish", len(df))
-    df["ob_bearish"] = _binary_col(ob_df, "OB", "Bearish", len(df))
+    try:
+        result["ob"] = _smc.ob(ohlc, result["swings"], close_mitigation=False)
+    except Exception as exc:
+        logger.warning("ob failed: %s", exc)
 
-    # ── Premium / Discount (relative to recent swing range) ──────────────────
-    df["premium_discount"] = _premium_discount(ohlc, structure)
-
-    # ── Liquidity sweep (high/low taken out) ──────────────────────────────────
-    df["liquidity_sweep"] = _liquidity_sweep(ohlc, structure)
-
-    logger.debug("SMC features added.")
-    return df
+    return result
 
 
-# ── private helpers ────────────────────────────────────────────────────────────
+def get_smc_snapshot(
+    smc_data: dict,
+    bar_idx: int,
+    price: float,
+    atr: float,
+    lookback: int = 20,
+    fvg_atr_threshold: float = 2.0,
+) -> dict[str, bool | int]:
+    """Extract SMC state at a specific bar index.
 
-def _flag_series(
-    df_struct: pd.DataFrame,
-    col_type: str,
-    direction: str,
-    n: int,
-) -> pd.Series:
-    """Return a binary Series of length *n* for a structure event."""
-    out = pd.Series(0, index=range(n))
-    if df_struct is None or df_struct.empty:
-        return out
-    mask = (df_struct.get("Type", pd.Series()) == col_type) & (
-        df_struct.get("Direction", pd.Series()) == direction
-    )
-    idx = df_struct[mask].index
-    out.iloc[idx[idx < n]] = 1
+    Produces binary features (True/False) suitable for ML or rule evaluation.
+
+    Parameters
+    ----------
+    smc_data:
+        Output of :func:`precompute_smc`.
+    bar_idx:
+        Integer position of the current bar (last completed bar before entry).
+    price:
+        Current close price (for proximity checks).
+    atr:
+        Current ATR value (for proximity checks).
+    lookback:
+        How many bars back to look for BOS/CHoCH events.
+    fvg_atr_threshold:
+        FVG Top or Bottom must be within this many ATRs of *price*.
+
+    Returns
+    -------
+    dict
+        Keys: bos_bull_recent, bos_bear_recent, choch_bull_recent,
+        choch_bear_recent, fvg_bull_near, fvg_bear_near,
+        ob_bull_near, ob_bear_near.
+    """
+    out: dict[str, bool | int] = {
+        "bos_bull_recent":  False,
+        "bos_bear_recent":  False,
+        "choch_bull_recent": False,
+        "choch_bear_recent": False,
+        "fvg_bull_near":    False,
+        "fvg_bear_near":    False,
+        "ob_bull_near":     False,
+        "ob_bear_near":     False,
+    }
+
+    # ── BOS / CHoCH ───────────────────────────────────────────────────────────
+    bos_df = smc_data.get("bos")
+    if bos_df is not None and not bos_df.empty and "BrokenIndex" in bos_df.columns:
+        bi = bos_df["BrokenIndex"].dropna()
+        window_mask = (bi <= bar_idx) & (bi >= bar_idx - lookback)
+        window = bos_df.loc[bi[window_mask].index]
+
+        out["bos_bull_recent"]   = bool((window.get("BOS",   pd.Series()) == 1.0).any())
+        out["bos_bear_recent"]   = bool((window.get("BOS",   pd.Series()) == -1.0).any())
+        out["choch_bull_recent"] = bool((window.get("CHOCH", pd.Series()) == 1.0).any())
+        out["choch_bear_recent"] = bool((window.get("CHOCH", pd.Series()) == -1.0).any())
+
+    # ── FVG (unmitigated, near price) ─────────────────────────────────────────
+    fvg_df = smc_data.get("fvg")
+    if fvg_df is not None and not fvg_df.empty and atr > 0:
+        # Keep only FVGs that formed before current bar
+        active = fvg_df[fvg_df.index <= bar_idx].copy()
+        # Unmitigated: MitigatedIndex is NaN OR mitigated after current bar
+        unmit_mask = active["MitigatedIndex"].isna() | (active["MitigatedIndex"] > bar_idx)
+        active = active[unmit_mask]
+        # Near price
+        prox = fvg_atr_threshold * atr
+        near = active[
+            ((active["Top"] - price).abs() < prox) |
+            ((active["Bottom"] - price).abs() < prox) |
+            ((price >= active["Bottom"]) & (price <= active["Top"]))
+        ]
+        out["fvg_bull_near"] = bool((near.get("FVG", pd.Series()) == 1.0).any())
+        out["fvg_bear_near"] = bool((near.get("FVG", pd.Series()) == -1.0).any())
+
+    # ── Order Blocks (unmitigated, near price) ────────────────────────────────
+    ob_df = smc_data.get("ob")
+    if ob_df is not None and not ob_df.empty and atr > 0:
+        active = ob_df[ob_df.index <= bar_idx].copy()
+        unmit_mask = active["MitigatedIndex"].isna() | (active["MitigatedIndex"] > bar_idx)
+        active = active[unmit_mask]
+        prox = fvg_atr_threshold * atr
+        near = active[
+            ((active["Top"] - price).abs() < prox) |
+            ((active["Bottom"] - price).abs() < prox) |
+            ((price >= active["Bottom"]) & (price <= active["Top"]))
+        ]
+        out["ob_bull_near"] = bool((near.get("OB", pd.Series()) == 1.0).any())
+        out["ob_bear_near"] = bool((near.get("OB", pd.Series()) == -1.0).any())
+
     return out
-
-
-def _binary_col(
-    df_feat: pd.DataFrame,
-    col: str,
-    direction: str,
-    n: int,
-) -> pd.Series:
-    """Return a binary Series where the feature column matches *direction*."""
-    out = pd.Series(0, index=range(n))
-    if df_feat is None or df_feat.empty or col not in df_feat.columns:
-        return out
-    mask = df_feat[col] == direction
-    idx = df_feat[mask].index
-    out.iloc[idx[idx < n]] = 1
-    return out
-
-
-def _premium_discount(
-    ohlc: pd.DataFrame,
-    structure: pd.DataFrame,
-    lookback: int = 50,
-) -> pd.Series:
-    """Classify each bar as premium (+1) or discount (-1) vs. mid of recent range."""
-    mid = (ohlc["high"].rolling(lookback).max() + ohlc["low"].rolling(lookback).min()) / 2
-    return np.sign(ohlc["close"] - mid).fillna(0).astype(int)
-
-
-def _liquidity_sweep(ohlc: pd.DataFrame, structure: pd.DataFrame) -> pd.Series:
-    """Flag bars where the current high/low takes out a recent swing level."""
-    highs = ohlc["high"]
-    lows = ohlc["low"]
-    prev_high = highs.shift(1).rolling(5).max()
-    prev_low = lows.shift(1).rolling(5).min()
-    sweep = ((highs > prev_high) | (lows < prev_low)).astype(int)
-    return sweep.fillna(0)

@@ -6,6 +6,13 @@ data/raw/
 *.parquet
 *.feather
 
+# ── v2 datos (raw, ground truth — nunca commitear) ───────────────────────────
+v2/data/raw_mt5/
+v2/data/raw_dukascopy/
+v2/data/ground_truth/
+v2/data/features/
+v2/data/reports/
+
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]

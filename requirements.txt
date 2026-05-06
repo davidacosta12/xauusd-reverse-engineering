@@ -13,7 +13,8 @@ seaborn>=0.13.0
 plotly>=5.20.0
 
 # ── Technical indicators ──────────────────────────────────────────────────────
-pandas-ta>=0.3.14b0
+# pandas-ta only supports Python >=3.12 as of its latest releases; use ta instead
+ta>=0.11.0
 
 # ── Smart Money Concepts ──────────────────────────────────────────────────────
 smartmoneyconcepts>=0.0.14
