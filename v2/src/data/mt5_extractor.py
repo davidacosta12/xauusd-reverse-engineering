@@ -1,20 +1,22 @@
-"""Extractor de datos desde MetaTrader5 para el proyecto v2.
+"""Extractor MT5 para XAUUSD.. desde el broker MEX Atlantic.
 
-Conecta al broker MEX Atlantic (investor read-only) y extrae:
-- Historial completo de trades cerrados
-- OHLCV en múltiples timeframes
+Modo de operación:
+- Trades: usa mt5.history_deals_get() y agrupa por position_id para
+  reconstruir los trades reales (entrada + salida).
+- OHLC: usa mt5.copy_rates_range() por timeframe.
 
-Todo el tiempo se convierte a UTC antes de persistir.
+Convención de tiempo:
+- MT5 server = GMT+3. TODOS los timestamps se convierten a UTC antes de guardar.
 """
 import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
-from v2.src.utils.timezone import df_server_to_utc, server_to_utc
 from v2.config.settings import (
     DATA_RAW_MT5,
     MT5_GMT_OFFSET_HOURS,
@@ -28,11 +30,9 @@ from v2.config.settings import (
 
 logger = logging.getLogger(__name__)
 
-# Carga .env desde la raíz del proyecto (dos niveles arriba de v2/)
 _ENV_PATH = Path(__file__).parent.parent.parent.parent / ".env"
 load_dotenv(_ENV_PATH)
 
-# Mapa de nombre de timeframe a constante MT5
 _TF_MAP: dict[str, int] = {}
 
 
@@ -55,22 +55,13 @@ def _get_tf_constant(tf_name: str) -> int:
     return mapping[tf_name]
 
 
-def _connect_mt5() -> bool:
-    """Inicializa y autentica la conexión con MetaTrader5.
-
-    Lee credenciales de .env: MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH.
-
-    Returns:
-        True si la conexión fue exitosa.
-
-    Raises:
-        RuntimeError: si la inicialización o login falla.
-    """
+def connect_mt5() -> bool:
+    """Conecta a MT5 leyendo .env. Devuelve True si OK."""
     import MetaTrader5 as mt5
 
     password = os.getenv("MT5_PASSWORD")
     server = os.getenv("MT5_SERVER", MT5_SERVER)
-    login = int(os.getenv("MT5_LOGIN", MT5_LOGIN))
+    login = int(os.getenv("MT5_LOGIN", str(MT5_LOGIN)))
     path = os.getenv("MT5_PATH") or None
 
     init_kwargs: dict = {}
@@ -96,178 +87,183 @@ def _connect_mt5() -> bool:
     return True
 
 
-def _shutdown_mt5() -> None:
+def disconnect_mt5() -> None:
+    """Cierra la conexión MT5."""
     import MetaTrader5 as mt5
     mt5.shutdown()
 
 
+# Alias privado para compatibilidad interna
+_connect_mt5 = connect_mt5
+_shutdown_mt5 = disconnect_mt5
+
+
+def _infer_close_type(comment: object) -> str:
+    """Infiere el tipo de cierre a partir del comment del deal OUT."""
+    if not isinstance(comment, str) or not comment.strip():
+        return "manual"
+    c = comment.lower()
+    if "[sl" in c:
+        return "sl"
+    if "[tp" in c:
+        return "tp"
+    return "manual"
+
+
+
 def extract_trade_history(
+    date_from_utc: datetime | None = None,
+    date_to_utc: datetime | None = None,
+    symbol: str = SYMBOL_BROKER,
     save_parquet: bool = True,
 ) -> pd.DataFrame:
-    """Extrae el historial completo de deals (trades cerrados) de la cuenta.
+    """Extrae los trades del periodo. Devuelve DataFrame con UN row por posición real.
 
-    Filtra únicamente deals de tipo DEAL_TYPE_BUY y DEAL_TYPE_SELL
-    en la entrada/salida de posiciones. Empareja entrada + salida por position_id.
+    Columnas:
+        position_id, ticket_in, ticket_out,
+        time_open_utc, time_close_utc, duration_minutes,
+        type (str: 'BUY'/'SELL'), volume,
+        price_open, price_close, sl, tp,
+        swap, commission, profit,
+        magic, comment_open, comment_close, comment_close_inferred_type
 
-    Returns:
-        DataFrame con columnas:
-            ticket, position_id,
-            time_open_utc, time_close_utc, duration_minutes,
-            type (BUY/SELL),
-            volume, price_open, price_close,
-            sl, tp, swap, commission, profit,
-            magic, comment
+    comment_close_inferred_type es 'sl' / 'tp' / 'manual' inferido del comment del deal OUT.
+    Tiempos en UTC tz-aware. Ordenado por time_open_utc ascendente.
+    Guarda en v2/data/raw_mt5/trades.parquet si save_parquet=True.
     """
     import MetaTrader5 as mt5
 
-    _connect_mt5()
-    try:
-        # Descarga TODOS los deals del historial completo de la cuenta
-        deals = mt5.history_deals_get(
-            datetime(2000, 1, 1, tzinfo=timezone.utc),
-            datetime(2030, 1, 1, tzinfo=timezone.utc),
-        )
-        if deals is None or len(deals) == 0:
-            raise RuntimeError(f"No se obtuvieron deals: {mt5.last_error()}")
+    date_from_utc = date_from_utc or PERIOD_START_UTC
+    date_to_utc = date_to_utc or PERIOD_END_UTC
 
-        df_deals = pd.DataFrame(list(deals), columns=deals[0]._asdict().keys())
-        logger.info("Total deals raw: %d", len(df_deals))
+    deals = mt5.history_deals_get(date_from_utc, date_to_utc)
+    if deals is None or len(deals) == 0:
+        raise RuntimeError(f"No deals retornados. last_error: {mt5.last_error()}")
 
-    finally:
-        _shutdown_mt5()
+    deals_df = pd.DataFrame(list(deals), columns=deals[0]._asdict().keys())
+    logger.info("Deals raw descargados: %d", len(deals_df))
 
-    # Filtrar solo deals de XAUUSD (el símbolo puede tener los "..")
-    df_deals = df_deals[df_deals["symbol"].str.startswith("XAUUSD")]
+    # Filtrar por símbolo exacto
+    deals_df = deals_df[deals_df["symbol"] == symbol].copy()
+    logger.info("Deals de %s: %d", symbol, len(deals_df))
 
-    # Separar entradas y salidas
-    # DEAL_ENTRY_IN = 0, DEAL_ENTRY_OUT = 1
-    df_in = df_deals[df_deals["entry"] == 0].copy()
-    df_out = df_deals[df_deals["entry"] == 1].copy()
-
-    # Convertir tiempos server → UTC
-    df_in["time_utc"] = pd.to_datetime(df_in["time"], unit="s", utc=True) - pd.Timedelta(hours=MT5_GMT_OFFSET_HOURS)
-    df_out["time_utc"] = pd.to_datetime(df_out["time"], unit="s", utc=True) - pd.Timedelta(hours=MT5_GMT_OFFSET_HOURS)
-
-    # Emparejar por position_id
-    df_in = df_in.set_index("position_id")
-    df_out = df_out.set_index("position_id")
-
-    merged = df_in.join(df_out, how="inner", lsuffix="_open", rsuffix="_close")
-
-    trades = pd.DataFrame()
-    trades["ticket"] = merged["deal_open"] if "deal_open" in merged.columns else merged.index
-    trades["position_id"] = merged.index
-    trades["time_open_utc"] = merged["time_utc_open"]
-    trades["time_close_utc"] = merged["time_utc_close"]
-    trades["duration_minutes"] = (
-        (trades["time_close_utc"] - trades["time_open_utc"])
-        .dt.total_seconds() / 60
-    ).round(1)
-
-    # Tipo de operación
-    # DEAL_TYPE_BUY = 0, DEAL_TYPE_SELL = 1
-    trades["type"] = merged["type_open"].map({0: "BUY", 1: "SELL"})
-
-    trades["volume"] = merged["volume_open"]
-    trades["price_open"] = merged["price_open"]
-    trades["price_close"] = merged["price_close"]
-    trades["sl"] = merged.get("sl_open", 0.0)
-    trades["tp"] = merged.get("tp_open", 0.0)
-    trades["swap"] = merged["swap_close"] if "swap_close" in merged.columns else 0.0
-    trades["commission"] = (
-        merged.get("commission_open", 0.0).fillna(0)
-        + merged.get("commission_close", 0.0).fillna(0)
+    # Convertir time (Unix server GMT+3) → UTC datetime tz-aware
+    deals_df["time_utc"] = (
+        pd.to_datetime(deals_df["time"], unit="s", utc=True)
+        - pd.Timedelta(hours=MT5_GMT_OFFSET_HOURS)
     )
-    trades["profit"] = merged["profit_close"] if "profit_close" in merged else merged.get("profit_open", 0.0)
-    trades["magic"] = merged.get("magic_open", 0)
-    trades["comment"] = merged.get("comment_open", "")
 
-    trades = trades.reset_index(drop=True).sort_values("time_open_utc")
+    # Filtrar solo deals con entry IN (0) o OUT (1); descartar balance, credit, etc.
+    deals_df = deals_df[deals_df["entry"].isin([mt5.DEAL_ENTRY_IN, mt5.DEAL_ENTRY_OUT])].copy()
 
+    deals_in  = deals_df[deals_df["entry"] == mt5.DEAL_ENTRY_IN].copy()
+    deals_out = deals_df[deals_df["entry"] == mt5.DEAL_ENTRY_OUT].copy()
+
+    logger.info("Deals IN: %d | Deals OUT: %d", len(deals_in), len(deals_out))
+
+    # Merge por position_id (inner = solo posiciones cerradas dentro del periodo)
+    merged = pd.merge(
+        deals_in.add_suffix("_in"),
+        deals_out.add_suffix("_out"),
+        left_on="position_id_in",
+        right_on="position_id_out",
+        how="inner",
+    )
+
+    result = pd.DataFrame({
+        "position_id":    merged["position_id_in"].astype("int64"),
+        "ticket_in":      merged["ticket_in"].astype("int64"),
+        "ticket_out":     merged["ticket_out"].astype("int64"),
+        "time_open_utc":  merged["time_utc_in"],
+        "time_close_utc": merged["time_utc_out"],
+        "duration_minutes": (
+            (merged["time_utc_out"] - merged["time_utc_in"])
+            .dt.total_seconds() / 60
+        ).round(1),
+        "type":           merged["type_in"].map({mt5.DEAL_TYPE_BUY: "BUY", mt5.DEAL_TYPE_SELL: "SELL"}),
+        "volume":         merged["volume_in"],
+        "price_open":     merged["price_in"],
+        "price_close":    merged["price_out"],
+        "sl":             np.nan,
+        "tp":             np.nan,
+        "swap":           merged["swap_out"],
+        "commission":     merged["commission_in"].fillna(0) + merged["commission_out"].fillna(0),
+        "profit":         merged["profit_out"],
+        "magic":          merged["magic_in"],
+        "comment_open":   merged["comment_in"],
+        "comment_close":  merged["comment_out"],
+    })
+
+    result["comment_close_inferred_type"] = result["comment_close"].apply(_infer_close_type)
+
+    # MEX Atlantic no almacena SL/TP en el historial de la API para órdenes de mercado.
+    # Mejor aproximación disponible: cuando el broker confirma el cierre vía comment
+    # ("[sl ...]" / "[tp ...]"), el price_close ES el nivel ejecutado de SL o TP.
+    sl_mask = result["comment_close_inferred_type"] == "sl"
+    tp_mask = result["comment_close_inferred_type"] == "tp"
+    result.loc[sl_mask, "sl"] = result.loc[sl_mask, "price_close"]
+    result.loc[tp_mask, "tp"] = result.loc[tp_mask, "price_close"]
     logger.info(
-        "Trades extraídos: %d | periodo: %s → %s",
-        len(trades),
-        trades["time_open_utc"].min(),
-        trades["time_open_utc"].max(),
+        "SL/TP recuperados via comment: sl=%d tp=%d manual(sin SL/TP)=%d",
+        sl_mask.sum(), tp_mask.sum(), (~sl_mask & ~tp_mask).sum(),
     )
-    logger.info(
-        "Profit total: $%.2f | BUY: %d | SELL: %d",
-        trades["profit"].sum(),
-        (trades["type"] == "BUY").sum(),
-        (trades["type"] == "SELL").sum(),
-    )
+
+    result = result.sort_values("time_open_utc").reset_index(drop=True)
+
+    logger.info("Total trades: %d", len(result))
+    logger.info("  BUY:  %d", (result["type"] == "BUY").sum())
+    logger.info("  SELL: %d", (result["type"] == "SELL").sum())
+    logger.info("  Ganadores: %d", (result["profit"] > 0).sum())
+    logger.info("  Win rate: %.1f%%", (result["profit"] > 0).mean() * 100)
+    logger.info("  P&L total: $%.2f", result["profit"].sum())
+    logger.info("  Periodo: %s → %s", result["time_open_utc"].min(), result["time_open_utc"].max())
+    logger.info("  Cierres por tipo: %s", result["comment_close_inferred_type"].value_counts().to_dict())
 
     if save_parquet:
-        DATA_RAW_MT5.mkdir(parents=True, exist_ok=True)
         out_path = DATA_RAW_MT5 / "trades.parquet"
-        trades.to_parquet(out_path, index=False)
-        logger.info("Trades guardados en %s (%.1f KB)", out_path, out_path.stat().st_size / 1024)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        result.to_parquet(out_path, index=False)
+        logger.info("Trades guardados: %s (%d trades)", out_path, len(result))
 
-    return trades
+    return result
 
 
 def extract_ohlc(
     timeframe: str,
-    start_utc: datetime | None = None,
-    end_utc: datetime | None = None,
+    date_from_utc: datetime | None = None,
+    date_to_utc: datetime | None = None,
+    symbol: str = SYMBOL_BROKER,
     save_parquet: bool = True,
 ) -> pd.DataFrame:
-    """Extrae velas OHLCV del broker MT5 para el símbolo XAUUSD.
+    """Extrae OHLCV de un timeframe.
 
-    Los tiempos en MT5 son hora server (GMT+3). Esta función los convierte a UTC
-    antes de devolver y guardar el DataFrame.
-
-    Args:
-        timeframe: nombre del timeframe ('M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1').
-        start_utc: inicio del periodo en UTC. Default: PERIOD_START_UTC.
-        end_utc: fin del periodo en UTC. Default: PERIOD_END_UTC.
-        save_parquet: si True, guarda el resultado en data/raw_mt5/.
-
-    Returns:
-        DataFrame con índice DatetimeIndex UTC y columnas:
-            open, high, low, close, tick_volume, real_volume, spread
+    Devuelve DataFrame con índice DatetimeIndex UTC y columnas:
+        open, high, low, close, tick_volume, real_volume, spread.
+    Guarda en v2/data/raw_mt5/ohlc_{TF}.parquet si save_parquet=True.
     """
     import MetaTrader5 as mt5
+    from v2.src.utils.timezone import utc_to_server, df_server_to_utc
 
-    start_utc = start_utc or PERIOD_START_UTC
-    end_utc = end_utc or PERIOD_END_UTC
+    start_utc = date_from_utc or PERIOD_START_UTC
+    end_utc = date_to_utc or PERIOD_END_UTC
 
-    # MT5 copy_rates_range espera datetimes en hora local/server
-    # Usamos UTC directamente — la librería lo maneja correctamente cuando
-    # el sistema está configurado. Para seguridad, convertimos a hora server.
-    from v2.src.utils.timezone import utc_to_server
     start_server = utc_to_server(start_utc).to_pydatetime().replace(tzinfo=None)
     end_server = utc_to_server(end_utc).to_pydatetime().replace(tzinfo=None)
 
-    _connect_mt5()
-    try:
-        tf_const = _get_tf_constant(timeframe)
-        rates = mt5.copy_rates_range(SYMBOL_BROKER, tf_const, start_server, end_server)
+    tf_const = _get_tf_constant(timeframe)
+    rates = mt5.copy_rates_range(symbol, tf_const, start_server, end_server)
 
-        if rates is None or len(rates) == 0:
-            error = mt5.last_error()
-            logger.warning("No se obtuvieron velas para %s %s: %s", SYMBOL_BROKER, timeframe, error)
-            return pd.DataFrame()
-
-    finally:
-        _shutdown_mt5()
+    if rates is None or len(rates) == 0:
+        error = mt5.last_error()
+        logger.warning("No se obtuvieron velas para %s %s: %s", symbol, timeframe, error)
+        return pd.DataFrame()
 
     df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s")  # naive, hora server
-
-    # Convertir hora server → UTC
+    df["time"] = pd.to_datetime(df["time"], unit="s")
     df = df.set_index("time")
     df = df_server_to_utc(df)
     df.index.name = "time_utc"
 
-    # Renombrar columnas al estándar del proyecto
-    df = df.rename(columns={
-        "tick_volume": "tick_volume",
-        "real_volume": "real_volume",
-        "spread": "spread",
-    })
-
-    # Asegurar columnas presentes
     for col in ["real_volume", "spread"]:
         if col not in df.columns:
             df[col] = 0
@@ -276,49 +272,31 @@ def extract_ohlc(
 
     logger.info(
         "%s %s: %d velas | %s → %s",
-        SYMBOL_BROKER,
-        timeframe,
-        len(df),
-        df.index.min(),
-        df.index.max(),
+        symbol, timeframe, len(df), df.index.min(), df.index.max(),
     )
 
     if save_parquet:
-        DATA_RAW_MT5.mkdir(parents=True, exist_ok=True)
         out_path = DATA_RAW_MT5 / f"ohlc_{timeframe}.parquet"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(out_path)
-        logger.info(
-            "OHLC %s guardado en %s (%.1f KB)",
-            timeframe,
-            out_path,
-            out_path.stat().st_size / 1024,
-        )
+        logger.info("OHLC %s guardado en %s (%.1f KB)", timeframe, out_path, out_path.stat().st_size / 1024)
 
     return df
 
 
 def extract_all_timeframes(
     timeframes: list[str] | None = None,
-    start_utc: datetime | None = None,
-    end_utc: datetime | None = None,
+    date_from_utc: datetime | None = None,
+    date_to_utc: datetime | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Extrae OHLCV para todos los timeframes especificados.
-
-    Args:
-        timeframes: lista de nombres de timeframe. Default: TIMEFRAMES de settings.
-        start_utc: inicio del periodo en UTC.
-        end_utc: fin del periodo en UTC.
-
-    Returns:
-        Dict mapeando nombre de timeframe → DataFrame OHLCV.
-    """
+    """Extrae OHLCV para todos los timeframes especificados."""
     timeframes = timeframes or TIMEFRAMES
     results: dict[str, pd.DataFrame] = {}
 
     for tf in timeframes:
         logger.info("Extrayendo MT5 %s...", tf)
         try:
-            df = extract_ohlc(tf, start_utc=start_utc, end_utc=end_utc)
+            df = extract_ohlc(tf, date_from_utc=date_from_utc, date_to_utc=date_to_utc)
             results[tf] = df
         except Exception as exc:
             logger.error("Error extrayendo %s: %s", tf, exc)
