@@ -43,6 +43,7 @@ class TwelveDataExtractor:
         self,
         api_key: Optional[str] = None,
         cache_dir: Optional[Path] = None,
+        rate_limit_sleep_sec: float = RATE_LIMIT_SLEEP_SEC,
     ) -> None:
         self.api_key = api_key or os.getenv("TWELVE_DATA_API_KEY")
         if not self.api_key:
@@ -52,6 +53,7 @@ class TwelveDataExtractor:
             )
         self.cache_dir = Path(cache_dir) if cache_dir else Path("v2/data/twelve_data")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.rate_limit_sleep_sec = rate_limit_sleep_sec
 
     def _cache_path(self, symbol: str, interval: str) -> Path:
         safe = symbol.replace("/", "_").replace(":", "_")
@@ -118,6 +120,64 @@ class TwelveDataExtractor:
                 time.sleep(wait)
 
         return pd.DataFrame()
+
+    def _fetch_range_paginated(
+        self,
+        symbol: str,
+        interval: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """Descarga [start, end] paginando hacia atras cuando el API tope en 5000 velas.
+
+        El API de Twelve Data limita cada respuesta a 5000 velas (outputsize). Si el
+        rango pedido produce mas, hay que seguir pidiendo hacia atras desde la vela
+        mas antigua recibida hasta cubrir todo el rango.
+        """
+        chunks: list[pd.DataFrame] = []
+        current_end = end
+        chunk_num = 0
+
+        while True:
+            chunk_num += 1
+            df_chunk = self._request_chunk(
+                symbol, interval,
+                start.to_pydatetime(),
+                current_end.to_pydatetime(),
+            )
+            if df_chunk.empty:
+                break
+
+            chunks.append(df_chunk)
+            logger.info(
+                "    Chunk %d: %s a %s -> %d velas",
+                chunk_num,
+                df_chunk.index.min().strftime("%Y-%m-%d %H:%M"),
+                df_chunk.index.max().strftime("%Y-%m-%d %H:%M"),
+                len(df_chunk),
+            )
+
+            if len(df_chunk) < 5000 or df_chunk.index.min() <= start:
+                break
+
+            current_end = df_chunk.index.min() - pd.Timedelta(seconds=1)
+            time.sleep(self.rate_limit_sleep_sec)
+
+        if not chunks:
+            return pd.DataFrame()
+
+        combined = pd.concat(chunks)
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+        combined = combined.loc[start:end]
+
+        if not combined.empty:
+            logger.info(
+                "  Total: %d velas, cobertura: %s a %s",
+                len(combined),
+                combined.index.min().strftime("%Y-%m-%d %H:%M"),
+                combined.index.max().strftime("%Y-%m-%d %H:%M"),
+            )
+        return combined
 
     def _compute_missing_ranges(
         self,
@@ -195,19 +255,17 @@ class TwelveDataExtractor:
                 "  Chunk %d/%d: %s -> %s",
                 i, len(ranges_to_fetch), chunk_start, chunk_end,
             )
-            df_chunk = self._request_chunk(
+            df_chunk = self._fetch_range_paginated(
                 symbol, interval,
-                chunk_start.to_pydatetime(),
-                chunk_end.to_pydatetime(),
+                chunk_start, chunk_end,
             )
             if not df_chunk.empty:
                 all_new.append(df_chunk)
-                logger.info("    -> %d velas", len(df_chunk))
             else:
                 logger.warning("    -> 0 velas retornadas para este chunk")
 
             if i < len(ranges_to_fetch):
-                time.sleep(RATE_LIMIT_SLEEP_SEC)
+                time.sleep(self.rate_limit_sleep_sec)
 
         if all_new:
             new_df = pd.concat(all_new)

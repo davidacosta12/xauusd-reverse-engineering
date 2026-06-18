@@ -1,5 +1,15 @@
 """Extractor de datos XAUUSD desde Dukascopy (fuente de referencia externa).
 
+Expone dos interfaces:
+
+1. DukascopyExtractor (clase, Fase 7) — drop-in replacement de TwelveDataExtractor.
+   - fetch(symbol, interval, start, end) con cache incremental en parquet
+   - Intervalos: "1min", "5min", "15min", "1h", "4h"
+   - Salida: columnas open, high, low, close, volume | indice DatetimeIndex UTC
+
+2. extract_dukascopy_ohlc / extract_all_timeframes (funciones, Fase 0/1) — usadas
+   en el notebook 00. No se modifican.
+
 Usa `dukascopy-python` >= 4.0.1 para descargar velas históricas OHLCV
 y las normaliza al mismo formato que el extractor MT5.
 
@@ -21,6 +31,8 @@ ligeramente del broker MEX Atlantic (spread, feed) — eso es esperado.
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
@@ -279,3 +291,235 @@ def extract_all_timeframes(
             logger.error("Error no recuperable en Dukascopy %s: %s", tf, exc)
 
     return results
+
+
+# =============================================================================
+# DukascopyExtractor — interfaz Fase 7 (drop-in de TwelveDataExtractor)
+# =============================================================================
+
+
+class DukascopyExtractor:
+    """Descarga OHLC de Dukascopy con cache local en parquet.
+
+    Interfaz identica a TwelveDataExtractor: fetch(symbol, interval, start, end).
+    Sin rate limits, sin API key, hasta 20 anos de historia disponible.
+
+    Intervalos soportados: "1min", "5min", "15min", "30min", "1h", "4h", "1day".
+    Salida: columnas open, high, low, close, volume | indice DatetimeIndex UTC.
+    """
+
+    # Normaliza simbolos al formato que acepta dukascopy_python
+    _SYMBOL_MAP: dict[str, str] = {
+        "XAUUSD":  "XAU/USD",
+        "XAU/USD": "XAU/USD",
+    }
+
+    # Mapeo intervalo legible -> constante de dukascopy_python
+    _INTERVAL_MAP: dict[str, str] = {
+        "1min":  "INTERVAL_MIN_1",
+        "5min":  "INTERVAL_MIN_5",
+        "15min": "INTERVAL_MIN_15",
+        "30min": "INTERVAL_MIN_30",
+        "1h":    "INTERVAL_HOUR_1",
+        "4h":    "INTERVAL_HOUR_4",
+        "1day":  "INTERVAL_DAY_1",
+    }
+
+    SUPPORTED_INTERVALS = set(_INTERVAL_MAP.keys())
+
+    def __init__(self, cache_dir: Optional[Path] = None) -> None:
+        self.cache_dir = Path(cache_dir) if cache_dir else Path("v2/data/dukascopy")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Helpers internos
+    # ------------------------------------------------------------------
+
+    def _cache_path(self, symbol: str, interval: str) -> Path:
+        safe = symbol.replace("/", "_").replace(":", "_")
+        return self.cache_dir / f"{safe}_{interval}.parquet"
+
+    def _duka_symbol(self, symbol: str) -> str:
+        norm = self._SYMBOL_MAP.get(symbol)
+        if norm is None:
+            raise ValueError(
+                f"Simbolo '{symbol}' no reconocido. "
+                f"Opciones: {list(self._SYMBOL_MAP)}"
+            )
+        return norm
+
+    def _duka_interval(self, interval: str):
+        """Devuelve la constante dk.INTERVAL_* correspondiente."""
+        import dukascopy_python as dk
+
+        attr = self._INTERVAL_MAP.get(interval)
+        if attr is None:
+            raise ValueError(
+                f"Intervalo '{interval}' no soportado. "
+                f"Opciones: {list(self._INTERVAL_MAP)}"
+            )
+        return getattr(dk, attr)
+
+    def _compute_missing_ranges(
+        self,
+        cached: pd.DataFrame,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+    ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+        if cached.empty:
+            return [(start, end)]
+
+        cached_in_range = cached.loc[start:end]
+        if cached_in_range.empty:
+            return [(start, end)]
+
+        ranges: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        if start < cached_in_range.index.min() - pd.Timedelta(minutes=1):
+            ranges.append((start, cached_in_range.index.min() - pd.Timedelta(seconds=1)))
+        if end > cached_in_range.index.max() + pd.Timedelta(minutes=1):
+            ranges.append((cached_in_range.index.max() + pd.Timedelta(seconds=1), end))
+        return ranges
+
+    def _fetch_from_api(
+        self,
+        duka_symbol: str,
+        interval: str,
+        start: datetime,
+        end: datetime,
+        max_retries: int = 3,
+    ) -> pd.DataFrame:
+        """Una llamada a dukascopy_python.fetch() con reintentos."""
+        import dukascopy_python as dk
+
+        interval_const = self._duka_interval(interval)
+        start_tz = start if start.tzinfo else start.replace(tzinfo=timezone.utc)
+        end_tz   = end   if end.tzinfo   else end.replace(tzinfo=timezone.utc)
+
+        last_exc: Exception | None = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(
+                    "Dukascopy %s %s: descargando (intento %d/%d) %s -> %s",
+                    duka_symbol, interval, attempt, max_retries,
+                    start_tz.strftime("%Y-%m-%d"), end_tz.strftime("%Y-%m-%d"),
+                )
+                df = dk.fetch(
+                    instrument=duka_symbol,
+                    interval=interval_const,
+                    offer_side=dk.OFFER_SIDE_BID,
+                    start=start_tz,
+                    end=end_tz,
+                )
+                if df is not None and len(df) > 0:
+                    break
+                logger.warning("Dukascopy devolvio respuesta vacia (intento %d).", attempt)
+                df = pd.DataFrame()
+            except Exception as exc:
+                last_exc = exc
+                wait = 2.0 ** attempt
+                if attempt < max_retries:
+                    logger.warning("Error (intento %d/%d): %s. Reintentando en %.1fs...",
+                                   attempt, max_retries, exc, wait)
+                    time.sleep(wait)
+                else:
+                    logger.error("Dukascopy fallo tras %d intentos: %s", max_retries, last_exc)
+                    return pd.DataFrame()
+
+        if df is None or (hasattr(df, "__len__") and len(df) == 0):
+            return pd.DataFrame()
+
+        # Normalizar: indice UTC + columna volume (el pipeline renombrara a tick_volume)
+        df = df.copy()
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+
+        # dukascopy_python 4.x devuelve columnas open/high/low/close/volume
+        for col in ["open", "high", "low", "close"]:
+            if col not in df.columns:
+                logger.warning("Columna '%s' faltante en output de Dukascopy.", col)
+                df[col] = float("nan")
+        if "volume" not in df.columns:
+            df["volume"] = 0.0
+
+        return df[["open", "high", "low", "close", "volume"]].sort_index()
+
+    # ------------------------------------------------------------------
+    # Interfaz publica
+    # ------------------------------------------------------------------
+
+    def fetch(
+        self,
+        symbol: str,
+        interval: str,
+        start: datetime,
+        end: datetime,
+        force_refresh: bool = False,
+    ) -> pd.DataFrame:
+        """Descarga OHLC para el rango [start, end] con cache local.
+
+        Args:
+            symbol: "XAUUSD" o "XAU/USD"
+            interval: "1min", "5min", "15min", "1h", "4h", ...
+            start, end: datetime (UTC, con o sin tzinfo)
+            force_refresh: si True, ignora cache y re-descarga todo
+
+        Returns:
+            DataFrame columnas open, high, low, close, volume.
+            Indice DatetimeIndex UTC tz-aware.
+        """
+        if interval not in self.SUPPORTED_INTERVALS:
+            raise ValueError(
+                f"Intervalo no soportado: '{interval}'. "
+                f"Opciones: {sorted(self.SUPPORTED_INTERVALS)}"
+            )
+
+        duka_symbol = self._duka_symbol(symbol)
+        start_ts = pd.Timestamp(start, tz="UTC") if pd.Timestamp(start).tz is None else pd.Timestamp(start).tz_convert("UTC")
+        end_ts   = pd.Timestamp(end,   tz="UTC") if pd.Timestamp(end).tz is None   else pd.Timestamp(end).tz_convert("UTC")
+
+        cache_path = self._cache_path(symbol, interval)
+        cached = pd.DataFrame()
+
+        if cache_path.exists() and not force_refresh:
+            cached = pd.read_parquet(cache_path)
+            if cached.index.tz is None:
+                cached.index = cached.index.tz_localize("UTC")
+            logger.info(
+                "Cache %s/%s: %d velas (%s -> %s)",
+                symbol, interval, len(cached), cached.index.min(), cached.index.max(),
+            )
+            ranges_to_fetch = self._compute_missing_ranges(cached, start_ts, end_ts)
+        else:
+            ranges_to_fetch = [(start_ts, end_ts)]
+
+        if not ranges_to_fetch:
+            logger.info("Cache cubre el rango completo — sin descarga necesaria.")
+            return cached.loc[start_ts:end_ts].copy()
+
+        logger.info("Descargando %d chunk(s) desde Dukascopy...", len(ranges_to_fetch))
+        all_new: list[pd.DataFrame] = []
+
+        for i, (chunk_start, chunk_end) in enumerate(ranges_to_fetch, 1):
+            logger.info("  Chunk %d/%d: %s -> %s", i, len(ranges_to_fetch), chunk_start, chunk_end)
+            df_chunk = self._fetch_from_api(
+                duka_symbol, interval,
+                chunk_start.to_pydatetime(),
+                chunk_end.to_pydatetime(),
+            )
+            if not df_chunk.empty:
+                all_new.append(df_chunk)
+                logger.info("    -> %d velas", len(df_chunk))
+            else:
+                logger.warning("    -> 0 velas retornadas para este chunk")
+
+        if all_new:
+            new_df   = pd.concat(all_new)
+            combined = pd.concat([cached, new_df]) if not cached.empty else new_df
+            combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+            combined.to_parquet(cache_path)
+            logger.info("Cache actualizado: %d velas -> %s", len(combined), cache_path)
+            return combined.loc[start_ts:end_ts].copy()
+
+        return cached.loc[start_ts:end_ts].copy() if not cached.empty else pd.DataFrame()

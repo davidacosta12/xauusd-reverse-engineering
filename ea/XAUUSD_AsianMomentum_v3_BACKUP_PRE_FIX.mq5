@@ -343,36 +343,6 @@ ENUM_SIGNAL_TYPE EvaluateSignal(string &reason_out, double &asian_mid_out)
   }
 
 //+------------------------------------------------------------------+
-//|  CONTADOR DE TRADES DEL DIA (basado en historial real de deals)  |
-//+------------------------------------------------------------------+
-// Cuenta entradas reales ejecutadas hoy (DEAL_ENTRY_IN) para _Symbol
-// con el magic number del EA. Incluye duplicados que el contador interno
-// g_trades_today no detecta porque no pasan por OnSignalDetected.
-int ContarTradesHoy()
-  {
-   MqlDateTime tm;
-   TimeToStruct(TimeCurrent(), tm);
-   tm.hour = 0; tm.min = 0; tm.sec = 0;
-   datetime inicio_dia = StructToTime(tm);
-
-   if(!HistorySelect(inicio_dia, TimeCurrent()))
-      return g_trades_today; // fallback al contador interno si HistorySelect falla
-
-   int count = 0;
-   int total = HistoryDealsTotal();
-   for(int i = 0; i < total; i++)
-     {
-      ulong ticket = HistoryDealGetTicket(i);
-      if(ticket == 0) continue;
-      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
-      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != 20260512) continue;
-      if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
-      count++;
-     }
-   return count;
-  }
-
-//+------------------------------------------------------------------+
 //|  FILTROS OPERACIONALES                                           |
 //+------------------------------------------------------------------+
 bool CanExecuteSignal()
@@ -388,11 +358,10 @@ bool CanExecuteSignal()
       g_last_signal_ts = 0;
      }
 
-   // Max trades/dia (usa historial real de deals para detectar duplicados reales)
-   int trades_hoy = ContarTradesHoy();
-   if(UseMaxTradesPerDay && trades_hoy >= MaxTradesPerDay)
+   // Max trades/dia
+   if(UseMaxTradesPerDay && g_trades_today >= MaxTradesPerDay)
      {
-      Print("Filtro: max trades/dia alcanzado (", trades_hoy, "/", MaxTradesPerDay, ")");
+      Print("Filtro: max trades/dia alcanzado (", g_trades_today, "/", MaxTradesPerDay, ")");
       return false;
      }
 
@@ -422,42 +391,6 @@ bool CanExecuteSignal()
 //+------------------------------------------------------------------+
 bool ExecuteOrder(ENUM_SIGNAL_TYPE sig, double price, double sl, double tp)
   {
-   // === BLOQUEO ANTI-DUPLICADOS ===
-   // Rechaza un segundo envio si llegara una orden identica en menos de 60 seg
-   // (cubre race condition VPS donde OnTick puede disparar antes de que MT5
-   //  registre la posicion ya abierta).
-   static datetime s_ultimo_envio_buy  = 0;
-   static datetime s_ultimo_envio_sell = 0;
-   static double   s_ultimo_precio_buy  = 0.0;
-   static double   s_ultimo_precio_sell = 0.0;
-
-   datetime ahora = TimeCurrent();
-   if(sig == SIGNAL_BUY)
-     {
-      if(ahora - s_ultimo_envio_buy < 60 &&
-         MathAbs(price - s_ultimo_precio_buy) < 5.0 * _Point * 10)
-        {
-         PrintFormat("DUPLICADO BLOQUEADO: BUY enviado hace %d seg @ %.2f (actual %.2f)",
-                     (int)(ahora - s_ultimo_envio_buy), s_ultimo_precio_buy, price);
-         return false;
-        }
-      s_ultimo_envio_buy  = ahora;
-      s_ultimo_precio_buy = price;
-     }
-   else
-     {
-      if(ahora - s_ultimo_envio_sell < 60 &&
-         MathAbs(price - s_ultimo_precio_sell) < 5.0 * _Point * 10)
-        {
-         PrintFormat("DUPLICADO BLOQUEADO: SELL enviado hace %d seg @ %.2f (actual %.2f)",
-                     (int)(ahora - s_ultimo_envio_sell), s_ultimo_precio_sell, price);
-         return false;
-        }
-      s_ultimo_envio_sell  = ahora;
-      s_ultimo_precio_sell = price;
-     }
-   // === FIN BLOQUEO ANTI-DUPLICADOS ===
-
    MqlTradeRequest req = {};
    MqlTradeResult  res = {};
    req.action   = TRADE_ACTION_DEAL;
