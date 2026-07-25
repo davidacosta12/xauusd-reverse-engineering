@@ -422,24 +422,41 @@ bool CanExecuteSignal()
 //+------------------------------------------------------------------+
 bool ExecuteOrder(ENUM_SIGNAL_TYPE sig, double price, double sl, double tp)
   {
-   // === BLOQUEO ANTI-DUPLICADOS DE LA MISMA SEÑAL ===
-   // Una señal del EA debe generar UNA SOLA orden. Si en el mismo minuto M1
-   // ya se envio una orden (cualquier tipo), bloquear.
-   // El cooldown de 90 min garantiza que señales futuras sean independientes.
-   static datetime s_ultimo_minuto_orden = 0;
+   // === BLOQUEO ANTI-DUPLICADOS ===
+   // Rechaza un segundo envio si llegara una orden identica en menos de 60 seg
+   // (cubre race condition VPS donde OnTick puede disparar antes de que MT5
+   //  registre la posicion ya abierta).
+   static datetime s_ultimo_envio_buy  = 0;
+   static datetime s_ultimo_envio_sell = 0;
+   static double   s_ultimo_precio_buy  = 0.0;
+   static double   s_ultimo_precio_sell = 0.0;
 
    datetime ahora = TimeCurrent();
-   datetime minuto_actual = ahora - (ahora % 60);  // truncar al minuto
-
-   if(s_ultimo_minuto_orden == minuto_actual)
+   if(sig == SIGNAL_BUY)
      {
-      PrintFormat("DUPLICADO BLOQUEADO: ya se envio orden en este minuto (%s)",
-                  TimeToString(minuto_actual, TIME_DATE|TIME_MINUTES));
-      return false;
+      if(ahora - s_ultimo_envio_buy < 60 &&
+         MathAbs(price - s_ultimo_precio_buy) < 5.0 * _Point * 10)
+        {
+         PrintFormat("DUPLICADO BLOQUEADO: BUY enviado hace %d seg @ %.2f (actual %.2f)",
+                     (int)(ahora - s_ultimo_envio_buy), s_ultimo_precio_buy, price);
+         return false;
+        }
+      s_ultimo_envio_buy  = ahora;
+      s_ultimo_precio_buy = price;
      }
-
-   s_ultimo_minuto_orden = minuto_actual;
-   // === FIN BLOQUEO ===
+   else
+     {
+      if(ahora - s_ultimo_envio_sell < 60 &&
+         MathAbs(price - s_ultimo_precio_sell) < 5.0 * _Point * 10)
+        {
+         PrintFormat("DUPLICADO BLOQUEADO: SELL enviado hace %d seg @ %.2f (actual %.2f)",
+                     (int)(ahora - s_ultimo_envio_sell), s_ultimo_precio_sell, price);
+         return false;
+        }
+      s_ultimo_envio_sell  = ahora;
+      s_ultimo_precio_sell = price;
+     }
+   // === FIN BLOQUEO ANTI-DUPLICADOS ===
 
    MqlTradeRequest req = {};
    MqlTradeResult  res = {};
