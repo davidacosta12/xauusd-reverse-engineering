@@ -27,9 +27,9 @@ input group "=== Modo de operacion ==="
 input ENUM_OPERATION_MODE OperationMode  = MODE_ALERT_ONLY;
 
 input group "=== Risk Management ==="
-input double VolumeLots          = 0.02;   // Lotes por operacion
+input double VolumeLots          = 0.01;   // Lotes por operacion
 input bool   UseMaxTradesPerDay  = true;   // Limitar max entradas/dia
-input int    MaxTradesPerDay     = 2;      // Max entradas por session-day
+input int    MaxTradesPerDay     = 1;      // Max entradas por session-day
 input int    CooldownMinutes     = 90;     // Minutos minimos entre señales
 
 input group "=== Session asiatica (UTC) ==="
