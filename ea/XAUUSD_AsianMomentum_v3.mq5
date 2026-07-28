@@ -453,13 +453,24 @@ bool ExecuteOrder(ENUM_SIGNAL_TYPE sig, double price, double sl, double tp)
    req.deviation = SlippagePoints;
    req.magic    = 20260512;
    req.comment  = "AsianMomV3";
-   if(!OrderSend(req, res))
+   //--- Filling mode: detectar el que soporta el broker (evita retcode 10030)
+   int fill_mask = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((fill_mask & SYMBOL_FILLING_FOK) != 0)
+      req.type_filling = ORDER_FILLING_FOK;
+   else if((fill_mask & SYMBOL_FILLING_IOC) != 0)
+      req.type_filling = ORDER_FILLING_IOC;
+   else
+      req.type_filling = ORDER_FILLING_RETURN;
+
+   bool sent = OrderSend(req, res);
+   if(sent && res.retcode == TRADE_RETCODE_DONE)
      {
-      PrintFormat("OrderSend FAILED retcode=%d: %s", res.retcode, res.comment);
-      return false;
+      PrintFormat("[LIVE] Orden ejecutada. ticket=%I64d price=%.2f sl=%.2f tp=%.2f",
+                  res.order, res.price, sl, tp);
+      return true;
      }
-   PrintFormat("Order OK ticket=%I64d price=%.2f sl=%.2f tp=%.2f", res.order, res.price, sl, tp);
-   return true;
+   PrintFormat("OrderSend FAILED retcode=%d: %s", res.retcode, res.comment);
+   return false;
   }
 
 //+------------------------------------------------------------------+
@@ -541,7 +552,10 @@ void OnSignalDetected(ENUM_SIGNAL_TYPE sig, string reason, double asian_mid)
    if(OperationMode == MODE_PAPER)
       LogPaperTrade(now_utc, sig_str, price, sl, tp);
    else if(OperationMode == MODE_LIVE)
-      ExecuteOrder(sig, price, sl, tp);
+     {
+      if(!ExecuteOrder(sig, price, sl, tp))
+         return;   // orden fallida — no marcar cooldown ni incrementar counter
+     }
 
    // Actualizar estado operacional
    g_last_signal_ts = now_utc;
